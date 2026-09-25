@@ -10,7 +10,7 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 
-from rules import judge
+from rules import DEFAULT_ZONE, judge
 
 SECRET = os.environ.get("JWT_SECRET", "herb-process-dev-secret")
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54393/herb")
@@ -39,7 +39,14 @@ class StepIn(BaseModel):
 
 class BatchIn(BaseModel):
     herb: str = Field(min_length=1, max_length=80)
+    month: int | None = Field(default=None, ge=1, le=12)
     steps: list[StepIn]
+
+
+class ZoneIn(BaseModel):
+    month: int = Field(ge=1, le=12)
+    low_c: float = Field(gt=0, lt=500)
+    high_c: float = Field(gt=0, lt=500)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -56,8 +63,23 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=403, detail="仅炮制员可写入记录")
+        raise HTTPException(status_code=403, detail="仅炮制员可写入")
     return user
+
+
+def current_zone(conn, month: int) -> dict:
+    """取该月当前生效的温区（季节流水中最新一行）。"""
+    row = conn.execute(
+        """SELECT month, low_c, high_c, changed_by, changed_at
+           FROM season_zone_log
+           WHERE month = %s
+           ORDER BY id DESC
+           LIMIT 1""",
+        (month,),
+    ).fetchone()
+    if row is None:
+        return {"month": month, **DEFAULT_ZONE}
+    return row
 
 
 app = FastAPI(title="饮片炮制记录台")
@@ -77,15 +99,34 @@ def startup():
                 created_at timestamptz NOT NULL
             )"""
         )
-        count = conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]
-        if count == 0:
-            now = datetime.now(timezone.utc)
+        # 季节流水：只追加，不改写。每月当前温区取该月最新一行。
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS season_zone_log (
+                id serial PRIMARY KEY,
+                month int NOT NULL CHECK (month BETWEEN 1 AND 12),
+                low_c double precision NOT NULL,
+                high_c double precision NOT NULL,
+                changed_by text NOT NULL,
+                changed_at timestamptz NOT NULL
+            )"""
+        )
+        now = datetime.now(timezone.utc)
+        zone_count = conn.execute("SELECT COUNT(*) AS n FROM season_zone_log").fetchone()["n"]
+        if zone_count == 0:
+            for month in range(1, 13):
+                conn.execute(
+                    """INSERT INTO season_zone_log (month, low_c, high_c, changed_by, changed_at)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (month, DEFAULT_ZONE["low_c"], DEFAULT_ZONE["high_c"], "系统", now),
+                )
+        batch_count = conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]
+        if batch_count == 0:
             samples = [
-                ("甘草", {"steps": [{"name": "清炒", "temp_c": 120, "minutes": 12}]}),
-                ("黄芩", {"steps": [{"name": "清炒", "temp_c": 40, "minutes": 12}]}),
+                ("甘草", {"month": 6, "steps": [{"name": "清炒", "temp_c": 120, "minutes": 12}]}),
+                ("黄芩", {"month": 6, "steps": [{"name": "清炒", "temp_c": 40, "minutes": 12}]}),
             ]
             for herb, doc in samples:
-                verdict, reason = judge(doc)
+                verdict, reason = judge(doc, current_zone(conn, doc["month"]))
                 conn.execute(
                     """INSERT INTO batches (herb, doc, verdict, reason, created_by, created_at)
                        VALUES (%s, %s::jsonb, %s, %s, %s, %s)""",
@@ -118,9 +159,11 @@ def list_batches(_user: dict = Depends(current_user)):
 
 @app.post("/api/batches", status_code=201)
 def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
-    doc = {"steps": [s.model_dump() for s in body.steps]}
-    verdict, reason = judge(doc)
+    if body.month is None:
+        raise HTTPException(status_code=400, detail="写入必须声明月份")
+    doc = {"month": body.month, "steps": [s.model_dump() for s in body.steps]}
     with connect() as conn:
+        verdict, reason = judge(doc, current_zone(conn, body.month))
         row = conn.execute(
             """INSERT INTO batches (herb, doc, verdict, reason, created_by, created_at)
                VALUES (%s, %s::jsonb, %s, %s, %s, %s)
@@ -129,3 +172,45 @@ def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+@app.get("/api/season-zones")
+def list_season_zones(_user: dict = Depends(current_user)):
+    """十二月当前温区表：每月取季节流水最新一行。"""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT ON (month) month, low_c, high_c, changed_by, changed_at
+               FROM season_zone_log
+               ORDER BY month, id DESC"""
+        ).fetchall()
+    by_month = {r["month"]: r for r in rows}
+    return [by_month.get(m, {"month": m, **DEFAULT_ZONE}) for m in range(1, 13)]
+
+
+@app.post("/api/season-zones", status_code=201)
+def change_season_zone(body: ZoneIn, user: dict = Depends(require_writer)):
+    """改某月温区：向季节流水追加一行，早先流水行不改写，仅约束之后的提交。"""
+    if body.low_c >= body.high_c:
+        raise HTTPException(status_code=400, detail="温度下限必须低于上限")
+    with connect() as conn:
+        row = conn.execute(
+            """INSERT INTO season_zone_log (month, low_c, high_c, changed_by, changed_at)
+               VALUES (%s, %s, %s, %s, %s)
+               RETURNING id, month, low_c, high_c, changed_by, changed_at""",
+            (body.month, body.low_c, body.high_c, user["username"], datetime.now(timezone.utc)),
+        ).fetchone()
+        conn.commit()
+    return row
+
+
+@app.get("/api/season-zones/log")
+def season_zone_log(_user: dict = Depends(current_user)):
+    """季节流水：全部改线记录，新的在前，只读不改写。"""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id, month, low_c, high_c, changed_by, changed_at
+               FROM season_zone_log
+               ORDER BY id DESC
+               LIMIT 200"""
+        ).fetchall()
+    return rows
